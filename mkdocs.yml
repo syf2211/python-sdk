@@ -103,6 +103,7 @@ markdown_extensions:
 
 watch:
   - src/mcp
+  - src/mcp-types
 
 plugins:
   - search
@@ -117,7 +118,7 @@ plugins:
   - mkdocstrings:
       handlers:
         python:
-          paths: [src]
+          paths: [src, src/mcp-types]
           options:
             relative_crossrefs: true
             members_order: source

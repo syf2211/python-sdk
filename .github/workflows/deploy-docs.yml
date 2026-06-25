@@ -9,6 +9,7 @@ on:
       - docs/**
       - mkdocs.yml
       - src/mcp/**
+      - src/mcp-types/**
       - scripts/build-docs.sh
       - pyproject.toml
       - uv.lock
