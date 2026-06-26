@@ -3,7 +3,12 @@
 import pytest
 from pydantic import AnyHttpUrl, AnyUrl, ValidationError
 
-from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthMetadata
+from mcp.shared.auth import (
+    InvalidRedirectUriError,
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthMetadata,
+)
 
 
 def test_oauth():
@@ -151,6 +156,9 @@ def test_redirect_uris_anyurl_subtypes_canonicalized_for_membership():
     incoming = AnyUrl("https://example.com/callback")
     assert incoming in metadata.redirect_uris
     assert metadata.validate_redirect_uri(incoming) == incoming
+
+    with pytest.raises(InvalidRedirectUriError, match="not registered"):
+        metadata.validate_redirect_uri(AnyUrl("https://evil.example/callback"))
 
 
 def test_information_full_inherits_redirect_uri_canonicalization():
