@@ -17,6 +17,7 @@ from typing import Any, Generic, Literal, cast
 import anyio
 import anyio.abc
 import anyio.lowlevel
+import httpx
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp_types import (
     CONNECTION_CLOSED,
@@ -52,6 +53,31 @@ from mcp.shared.transport_context import TransportContext
 __all__ = ["JSONRPCDispatcher", "handler_exception_to_error_data", "progress_token_from_params"]
 
 logger = logging.getLogger(__name__)
+
+_TRANSPORT_ERROR_DATA_KEY = "transport_error"
+_HTTPX_ERROR_TYPES: dict[str, type[httpx.HTTPError]] = {
+    "ConnectError": httpx.ConnectError,
+    "TimeoutException": httpx.TimeoutException,
+    "NetworkError": httpx.NetworkError,
+    "TransportError": httpx.TransportError,
+    "HTTPError": httpx.HTTPError,
+}
+
+
+def _maybe_reraise_transport_error(error: ErrorData) -> None:
+    """Re-raise streamable-HTTP transport faults as raw ``httpx`` errors.
+
+    Auto-mode negotiation treats non-``MCPError`` transport failures as real
+    outages; wrapping them as JSON-RPC errors is only an in-process handoff.
+    """
+    if not isinstance(error.data, dict):
+        return
+    exc_name = error.data.get(_TRANSPORT_ERROR_DATA_KEY)
+    if not isinstance(exc_name, str):
+        return
+    exc_type = _HTTPX_ERROR_TYPES.get(exc_name, httpx.TransportError)
+    raise exc_type(error.message) from None
+
 
 _ABANDON_WRITE_TIMEOUT: float = 5
 """Bound for courtesy-cancel writes on the abandon paths; the caller-cancel
@@ -403,6 +429,7 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
             receive.close()
 
         if isinstance(outcome, ErrorData):
+            _maybe_reraise_transport_error(outcome)
             raise MCPError(code=outcome.code, message=outcome.message, data=outcome.data)
         return outcome
 

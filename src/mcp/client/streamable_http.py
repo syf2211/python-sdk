@@ -479,10 +479,26 @@ class StreamableHTTPTransport:
                     )
 
                     async def handle_request_async():
-                        if is_resumption:
-                            await self._handle_resumption_request(ctx)
-                        else:
-                            await self._handle_post_request(ctx)
+                        try:
+                            if is_resumption:
+                                await self._handle_resumption_request(ctx)
+                            else:
+                                await self._handle_post_request(ctx)
+                        except httpx.HTTPError as exc:
+                            # Letting this escape into `tg` would crash the outer task group
+                            # from a different task than the one yielding the streams,
+                            # producing an uncatchable cancel-scope RuntimeError instead of
+                            # a connect error at the caller.
+                            logger.warning("Transport error handling request: %s", exc)
+                            if isinstance(message, JSONRPCRequest):
+                                error_data = ErrorData(
+                                    code=INTERNAL_ERROR,
+                                    message=str(exc),
+                                    data={"transport_error": type(exc).__name__},
+                                )
+                                error_msg = SessionMessage(JSONRPCError(jsonrpc="2.0", id=message.id, error=error_data))
+                                with contextlib.suppress(anyio.BrokenResourceError, anyio.ClosedResourceError):
+                                    await read_stream_writer.send(error_msg)
 
                     # If this is a request, start a new task to handle it
                     if isinstance(message, JSONRPCRequest):
