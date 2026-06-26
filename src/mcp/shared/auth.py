@@ -84,6 +84,16 @@ class OAuthClientMetadata(BaseModel):
     software_id: str | None = None
     software_version: str | None = None
 
+    @field_validator("redirect_uris", mode="after")
+    @classmethod
+    def _canonicalize_redirect_uris(cls, v: list[AnyUrl] | None) -> list[AnyUrl] | None:
+        # Pydantic v2 URL types compare strictly by runtime class, so AnyHttpUrl
+        # instances stored here would fail membership checks against AnyUrl values
+        # parsed from incoming OAuth requests. Normalize to the declared base type.
+        if v is None:
+            return v
+        return [AnyUrl(str(uri)) for uri in v]
+
     @field_validator(
         "client_uri",
         "logo_uri",

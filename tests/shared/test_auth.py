@@ -1,7 +1,7 @@
 """Tests for OAuth 2.0 shared code."""
 
 import pytest
-from pydantic import ValidationError
+from pydantic import AnyHttpUrl, AnyUrl, ValidationError
 
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthMetadata
 
@@ -138,3 +138,25 @@ def test_invalid_non_empty_url_still_rejected():
     }
     with pytest.raises(ValidationError):
         OAuthClientMetadata.model_validate(data)
+
+
+def test_redirect_uris_anyurl_subtypes_canonicalized_for_membership():
+    """AnyUrl subtypes must compare equal after model validation (issue #2687)."""
+    metadata = OAuthClientMetadata(
+        redirect_uris=[AnyHttpUrl("https://example.com/callback")],
+    )
+    assert metadata.redirect_uris is not None
+    assert all(type(uri) is AnyUrl for uri in metadata.redirect_uris)
+
+    incoming = AnyUrl("https://example.com/callback")
+    assert incoming in metadata.redirect_uris
+    assert metadata.validate_redirect_uri(incoming) == incoming
+
+
+def test_information_full_inherits_redirect_uri_canonicalization():
+    info = OAuthClientInformationFull(
+        client_id="abc123",
+        redirect_uris=[AnyHttpUrl("https://example.com/callback")],
+    )
+    assert info.redirect_uris is not None
+    assert info.validate_redirect_uri(AnyUrl("https://example.com/callback")) == AnyUrl("https://example.com/callback")
