@@ -142,6 +142,18 @@ def test_mcpserver_run_stdio_serves_until_stdin_closes(monkeypatch: pytest.Monke
     assert response == JSONRPCResponse(jsonrpc="2.0", id=1, result={})
 
 
+@pytest.mark.parametrize("transport", ["stdio", "sse", "streamable-http"])
+def test_mcpserver_run_exits_cleanly_on_keyboard_interrupt(monkeypatch: pytest.MonkeyPatch, transport: str) -> None:
+    """Ctrl-C during `run()` should exit without re-raising KeyboardInterrupt."""
+
+    def raise_keyboard_interrupt(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(anyio, "run", raise_keyboard_interrupt)
+
+    MCPServer(name="InterruptServer").run(transport)  # type: ignore[arg-type]
+
+
 def test_mcpserver_run_stdio_runs_lifespan_cleanup_after_stdin_closes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Code after `yield` in a lifespan runs when stdin EOF ends `run("stdio")`.
 
