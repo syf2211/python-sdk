@@ -30,8 +30,9 @@ def extract_field_from_www_auth(response: Response, field_name: str) -> str | No
     if not www_auth_header:
         return None
 
-    # Pattern matches: field_name="value" or field_name=value (unquoted)
-    pattern = rf'{field_name}=(?:"([^"]+)"|([^\s,]+))'
+    # Match only complete auth-param names (header start or after whitespace/comma),
+    # so e.g. `scope` does not match inside `error_scope`.
+    pattern = rf'(?:^|[\s,]){re.escape(field_name)}=(?:"([^"]+)"|([^\s,]+))'
     match = re.search(pattern, www_auth_header)
 
     if match:

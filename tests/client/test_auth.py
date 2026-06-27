@@ -1685,6 +1685,8 @@ class TestWWWAuthenticate:
                 "resource_metadata",
                 "https://api.example.com/auth/metadata?version=1",
             ),
+            # Param name must not match as a substring of another param
+            ('Bearer error_scope="decoy", scope="read write"', "scope", "read write"),
         ],
     )
     def test_extract_field_from_www_auth_valid_cases(
@@ -1719,6 +1721,13 @@ class TestWWWAuthenticate:
             # Malformed field (empty value)
             ("Bearer scope=", "scope", "malformed scope parameter"),
             ("Bearer resource_metadata=", "resource_metadata", "malformed resource_metadata parameter"),
+            # Similar param names must not shadow the requested field
+            ('Bearer custom_scope="leaked"', "scope", "custom_scope shadows scope"),
+            (
+                'Bearer x_resource_metadata="https://decoy.example.com"',
+                "resource_metadata",
+                "x_resource_metadata shadows resource_metadata",
+            ),
         ],
     )
     def test_extract_field_from_www_auth_invalid_cases(
