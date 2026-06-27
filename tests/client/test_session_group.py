@@ -143,6 +143,57 @@ async def test_client_session_group_connect_to_server(mock_exit_stack: contextli
 
 
 @pytest.mark.anyio
+async def test_client_session_group_skips_unadvertised_capabilities(mock_exit_stack: contextlib.AsyncExitStack):
+    """Only query list_* methods for capabilities the server advertised."""
+    mock_server_info = mock.Mock(spec=types.Implementation)
+    mock_server_info.name = "ToolsOnlyServer"
+    mock_session = mock.AsyncMock(spec=mcp.ClientSession)
+    mock_tool = mock.Mock(spec=types.Tool)
+    mock_tool.name = "ping"
+    mock_session.list_tools.return_value = mock.AsyncMock(tools=[mock_tool])
+    mock_session.server_capabilities = types.ServerCapabilities(
+        tools=types.ToolsCapability(list_changed=False),
+    )
+
+    group = ClientSessionGroup(exit_stack=mock_exit_stack)
+    with mock.patch.object(group, "_establish_session", return_value=(mock_server_info, mock_session)):
+        await group.connect_to_server(StdioServerParameters(command="test"))
+
+    mock_session.list_tools.assert_awaited_once()
+    mock_session.list_prompts.assert_not_awaited()
+    mock_session.list_resources.assert_not_awaited()
+    assert list(group.tools) == ["ping"]
+    assert group.resources == {}
+    assert group.prompts == {}
+
+
+@pytest.mark.anyio
+async def test_client_session_group_skips_unadvertised_capabilities_after_discover(
+    mock_exit_stack: contextlib.AsyncExitStack,
+):
+    """Respect capabilities negotiated via server/discover, not only initialize."""
+    mock_server_info = mock.Mock(spec=types.Implementation)
+    mock_server_info.name = "ToolsOnlyServer"
+    mock_session = mock.AsyncMock(spec=mcp.ClientSession)
+    mock_tool = mock.Mock(spec=types.Tool)
+    mock_tool.name = "ping"
+    mock_session.list_tools.return_value = mock.AsyncMock(tools=[mock_tool])
+    mock_session.initialize_result = None
+    mock_session.server_capabilities = types.ServerCapabilities(
+        tools=types.ToolsCapability(list_changed=False),
+    )
+
+    group = ClientSessionGroup(exit_stack=mock_exit_stack)
+    with mock.patch.object(group, "_establish_session", return_value=(mock_server_info, mock_session)):
+        await group.connect_to_server(StdioServerParameters(command="test"))
+
+    mock_session.list_tools.assert_awaited_once()
+    mock_session.list_prompts.assert_not_awaited()
+    mock_session.list_resources.assert_not_awaited()
+    assert list(group.tools) == ["ping"]
+
+
+@pytest.mark.anyio
 async def test_client_session_group_connect_to_server_with_name_hook(mock_exit_stack: contextlib.AsyncExitStack):
     """Test connecting with a component name hook."""
     # --- Mock Dependencies ---
