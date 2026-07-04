@@ -197,6 +197,7 @@ class StreamableHTTPServerTransport:
         ] = {}
         self._sse_stream_writers: dict[RequestId, MemoryObjectSendStream[SSEEvent]] = {}
         self._terminated = False
+        self._request_registration_lock = anyio.Lock()
         # Idle timeout cancel scope; managed by the session manager.
         self.idle_scope: anyio.CancelScope | None = None
 
@@ -404,6 +405,44 @@ class StreamableHTTPServerTransport:
                 # Remove the request stream from the mapping
                 self._request_streams.pop(request_id, None)
 
+    async def _reserve_request_stream(
+        self,
+        request_id: RequestId,
+    ) -> MemoryObjectReceiveStream[EventMessage] | None:
+        """Reserve the per-request stream slot, or None if the id is already in flight."""
+        async with self._request_registration_lock:
+            if request_id in self._request_streams:
+                return None
+            self._request_streams[request_id] = anyio.create_memory_object_stream[EventMessage](
+                REQUEST_STREAM_BUFFER_SIZE
+            )
+            return self._request_streams[request_id][1]
+
+    async def _reject_duplicate_in_flight_request(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        message: JSONRPCRequest,
+        request_id: RequestId,
+        request_stream_reader: MemoryObjectReceiveStream[EventMessage] | None,
+    ) -> bool:
+        """Reject when `request_id` is already in flight. Returns True if rejected."""
+        if request_stream_reader is not None:
+            return False
+
+        error_response = JSONRPCError(
+            jsonrpc="2.0",
+            id=message.id,
+            error=ErrorData(
+                code=INVALID_REQUEST,
+                message="A request with this id is already in flight on this session",
+            ),
+        )
+        response = self._create_json_response(error_response)
+        await response(scope, receive, send)
+        return True
+
     async def handle_request(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Application entry point that handles all HTTP requests."""
         request = Request(scope, receive)
@@ -548,12 +587,13 @@ class StreamableHTTPServerTransport:
             )
 
             request_id = str(message.id)
+            request_stream_reader = await self._reserve_request_stream(request_id)
+            if await self._reject_duplicate_in_flight_request(
+                scope, receive, send, message, request_id, request_stream_reader
+            ):
+                return
 
             if self.is_json_response_enabled:
-                self._request_streams[request_id] = anyio.create_memory_object_stream[EventMessage](
-                    REQUEST_STREAM_BUFFER_SIZE
-                )
-                request_stream_reader = self._request_streams[request_id][1]
                 # Process the message
                 metadata = ServerMessageMetadata(request_context=request)
                 session_message = SessionMessage(message, metadata=metadata)
@@ -597,18 +637,17 @@ class StreamableHTTPServerTransport:
                 finally:
                     await self._clean_up_memory_streams(request_id)
             else:
-                # Mint the priming event before any per-request state exists:
-                # `EventStore.store_event` is user code and may raise, in which
-                # case the outer handler returns a 500 with nothing to clean up.
-                # Still strictly precedes dispatch, so storage order == wire order.
-                priming_event = await self._mint_priming_event(request_id, protocol_version)
+                try:
+                    # Mint the priming event after reserving the request stream so
+                    # concurrent POSTs with the same id cannot overwrite routing state
+                    # while user EventStore code runs.
+                    priming_event = await self._mint_priming_event(request_id, protocol_version)
+                except Exception:
+                    await self._clean_up_memory_streams(request_id)
+                    raise
 
                 sse_stream_writer, sse_stream_reader = anyio.create_memory_object_stream[SSEEvent](0)
                 self._sse_stream_writers[request_id] = sse_stream_writer
-                self._request_streams[request_id] = anyio.create_memory_object_stream[EventMessage](
-                    REQUEST_STREAM_BUFFER_SIZE
-                )
-                request_stream_reader = self._request_streams[request_id][1]
 
                 headers = {
                     "Cache-Control": "no-cache, no-transform",
