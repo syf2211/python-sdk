@@ -17,6 +17,7 @@ from typing import Any, Generic, Literal, cast
 import anyio
 import anyio.abc
 import anyio.lowlevel
+import httpx
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp_types import (
     CONNECTION_CLOSED,
@@ -65,6 +66,23 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+TRANSPORT_HTTP_ERROR_KEY = "mcp.transport_http_error"
+
+
+def transport_http_error_data(exc: httpx.HTTPError) -> dict[str, str]:
+    return {TRANSPORT_HTTP_ERROR_KEY: type(exc).__name__}
+
+
+def maybe_reraise_transport_http_error(error: ErrorData) -> None:
+    if not isinstance(error.data, dict):
+        return
+    exc_name = error.data.get(TRANSPORT_HTTP_ERROR_KEY)
+    if exc_name is None:
+        return
+    exc_cls = getattr(httpx, exc_name, httpx.HTTPError)
+    raise exc_cls(error.message)
+
 
 _ABANDON_WRITE_TIMEOUT: float = 5
 """Bound for courtesy-cancel writes on the abandon paths; the caller-cancel
@@ -430,6 +448,7 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
             receive.close()
 
         if isinstance(outcome, ErrorData):
+            maybe_reraise_transport_http_error(outcome)
             raise MCPError(code=outcome.code, message=outcome.message, data=outcome.data)
         return outcome
 

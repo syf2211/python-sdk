@@ -402,3 +402,12 @@ async def test_client_session_group_establish_session_parameterized(
             # 3. Assert returned values
             assert returned_server_info is mock_initialize_result.server_info
             assert returned_session is mock_entered_session
+
+
+@pytest.mark.anyio
+async def test_connect_to_unreachable_streamable_http_server_raises_mcp_error(free_tcp_port: int) -> None:
+    """Unreachable streamable-HTTP servers should surface MCPError to callers."""
+    async with ClientSessionGroup() as group:
+        params = StreamableHttpParameters(url=f"http://127.0.0.1:{free_tcp_port}/mcp/")
+        with pytest.raises(httpx.ConnectError, match="connection attempts failed"):
+            await group.connect_to_server(params)

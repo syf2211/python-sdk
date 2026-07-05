@@ -13,6 +13,7 @@ import httpx
 from anyio.abc import TaskGroup
 from httpx_sse import EventSource, ServerSentEvent, aconnect_sse
 from mcp_types import (
+    CONNECTION_CLOSED,
     INTERNAL_ERROR,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
@@ -34,7 +35,7 @@ from mcp.shared._compat import resync_tracer
 from mcp.shared._context_streams import ContextReceiveStream, ContextSendStream, create_context_streams
 from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp.shared.inbound import MCP_PROTOCOL_VERSION_HEADER
-from mcp.shared.jsonrpc_dispatcher import cancelled_request_id_from_params
+from mcp.shared.jsonrpc_dispatcher import cancelled_request_id_from_params, transport_http_error_data
 from mcp.shared.message import ClientMessageMetadata, SessionMessage
 
 logger = logging.getLogger(__name__)
@@ -312,6 +313,24 @@ class StreamableHTTPTransport:
             if self._in_flight_posts.get(request_id) is post:
                 del self._in_flight_posts[request_id]
 
+    async def _send_transport_error(
+        self,
+        ctx: RequestContext,
+        message: JSONRPCMessage,
+        exc: httpx.HTTPError,
+    ) -> None:
+        if isinstance(message, JSONRPCRequest):
+            error_data = ErrorData(
+                code=CONNECTION_CLOSED,
+                message=str(exc),
+                data=transport_http_error_data(exc),
+            )
+            await ctx.read_stream_writer.send(
+                SessionMessage(JSONRPCError(jsonrpc="2.0", id=message.id, error=error_data))
+            )
+            return
+        raise exc
+
     async def _handle_post_request(self, ctx: RequestContext) -> None:
         """Handle a POST request with response processing."""
         message = ctx.session_message.message
@@ -319,65 +338,68 @@ class StreamableHTTPTransport:
         if ctx.metadata is not None and ctx.metadata.headers is not None:
             headers.update(ctx.metadata.headers)
 
-        async with ctx.client.stream(
-            "POST",
-            self.url,
-            json=message.model_dump(by_alias=True, mode="json", exclude_unset=True),
-            headers=headers,
-        ) as response:
-            if response.status_code == 202:
-                logger.debug("Received 202 Accepted")
-                return
+        try:
+            async with ctx.client.stream(
+                "POST",
+                self.url,
+                json=message.model_dump(by_alias=True, mode="json", exclude_unset=True),
+                headers=headers,
+            ) as response:
+                if response.status_code == 202:
+                    logger.debug("Received 202 Accepted")
+                    return
 
-            if response.status_code >= 400:
-                if isinstance(message, JSONRPCRequest):
-                    # A spec-correct server may return the JSON-RPC error in the
-                    # body at a non-2xx status (e.g. 400 for INVALID_PARAMS, 404
-                    # for METHOD_NOT_FOUND). Surface that error rather than the
-                    # status-derived stand-in below.
-                    if response.headers.get("content-type", "").lower().startswith("application/json"):
-                        try:
-                            body = await response.aread()
-                            parsed = jsonrpc_message_adapter.validate_json(body, by_name=False)
-                            if isinstance(parsed, JSONRPCError):
-                                # The server may have set `id: null` (request rejected before its
-                                # id was parsed); use this request's id so correlation works.
-                                reply = JSONRPCError(jsonrpc="2.0", id=message.id, error=parsed.error)
-                                await ctx.read_stream_writer.send(SessionMessage(reply))
-                                return
-                        except (httpx.StreamError, ValidationError):
-                            pass
-                        logger.debug("Non-2xx body was not a JSON-RPC error; using fallback")
-                    if response.status_code == 404:
-                        if self.session_id is None:
-                            # No session yet → 404 is the HTTP-level spelling of
-                            # METHOD_NOT_FOUND (gateway / legacy server doesn't know
-                            # this method); "Session terminated" would be a lie here.
-                            error_data = ErrorData(code=METHOD_NOT_FOUND, message="Not Found")
+                if response.status_code >= 400:
+                    if isinstance(message, JSONRPCRequest):
+                        # A spec-correct server may return the JSON-RPC error in the
+                        # body at a non-2xx status (e.g. 400 for INVALID_PARAMS, 404
+                        # for METHOD_NOT_FOUND). Surface that error rather than the
+                        # status-derived stand-in below.
+                        if response.headers.get("content-type", "").lower().startswith("application/json"):
+                            try:
+                                body = await response.aread()
+                                parsed = jsonrpc_message_adapter.validate_json(body, by_name=False)
+                                if isinstance(parsed, JSONRPCError):
+                                    # The server may have set `id: null` (request rejected before its
+                                    # id was parsed); use this request's id so correlation works.
+                                    reply = JSONRPCError(jsonrpc="2.0", id=message.id, error=parsed.error)
+                                    await ctx.read_stream_writer.send(SessionMessage(reply))
+                                    return
+                            except (httpx.StreamError, ValidationError):
+                                pass
+                            logger.debug("Non-2xx body was not a JSON-RPC error; using fallback")
+                        if response.status_code == 404:
+                            if self.session_id is None:
+                                # No session yet → 404 is the HTTP-level spelling of
+                                # METHOD_NOT_FOUND (gateway / legacy server doesn't know
+                                # this method); "Session terminated" would be a lie here.
+                                error_data = ErrorData(code=METHOD_NOT_FOUND, message="Not Found")
+                            else:
+                                error_data = ErrorData(code=INVALID_REQUEST, message="Session terminated")
                         else:
-                            error_data = ErrorData(code=INVALID_REQUEST, message="Session terminated")
+                            error_data = ErrorData(code=INTERNAL_ERROR, message="Server returned an error response")
+                        session_message = SessionMessage(JSONRPCError(jsonrpc="2.0", id=message.id, error=error_data))
+                        await ctx.read_stream_writer.send(session_message)
+                    return
+
+                if self._is_initialization_request(message):
+                    self._maybe_extract_session_id_from_response(response)
+
+                # Per https://modelcontextprotocol.io/specification/2025-06-18/basic#notifications:
+                # The server MUST NOT send a response to notifications.
+                if isinstance(message, JSONRPCRequest):
+                    content_type = response.headers.get("content-type", "").lower()
+                    if content_type.startswith("application/json"):
+                        await self._handle_json_response(response, ctx.read_stream_writer, request_id=message.id)
+                    elif content_type.startswith("text/event-stream"):
+                        await self._handle_sse_response(response, ctx)
                     else:
-                        error_data = ErrorData(code=INTERNAL_ERROR, message="Server returned an error response")
-                    session_message = SessionMessage(JSONRPCError(jsonrpc="2.0", id=message.id, error=error_data))
-                    await ctx.read_stream_writer.send(session_message)
-                return
-
-            if self._is_initialization_request(message):
-                self._maybe_extract_session_id_from_response(response)
-
-            # Per https://modelcontextprotocol.io/specification/2025-06-18/basic#notifications:
-            # The server MUST NOT send a response to notifications.
-            if isinstance(message, JSONRPCRequest):
-                content_type = response.headers.get("content-type", "").lower()
-                if content_type.startswith("application/json"):
-                    await self._handle_json_response(response, ctx.read_stream_writer, request_id=message.id)
-                elif content_type.startswith("text/event-stream"):
-                    await self._handle_sse_response(response, ctx)
-                else:
-                    logger.error(f"Unexpected content type: {content_type}")
-                    error_data = ErrorData(code=INVALID_REQUEST, message=f"Unexpected content type: {content_type}")
-                    error_msg = SessionMessage(JSONRPCError(jsonrpc="2.0", id=message.id, error=error_data))
-                    await ctx.read_stream_writer.send(error_msg)
+                        logger.error(f"Unexpected content type: {content_type}")
+                        error_data = ErrorData(code=INVALID_REQUEST, message=f"Unexpected content type: {content_type}")
+                        error_msg = SessionMessage(JSONRPCError(jsonrpc="2.0", id=message.id, error=error_data))
+                        await ctx.read_stream_writer.send(error_msg)
+        except httpx.HTTPError as exc:
+            await self._send_transport_error(ctx, message, exc)
 
     async def _handle_json_response(
         self,
