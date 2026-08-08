@@ -2221,6 +2221,53 @@ async def test_progress_with_bool_token_or_bool_progress_does_not_fire_callback(
 
 
 @pytest.mark.anyio
+async def test_progress_with_bool_total_passes_none_to_callback():
+    """Bool `total` is malformed; the callback must receive `None`, not `1.0`."""
+    c2s_send, c2s_recv = anyio.create_memory_object_stream[SessionMessage | Exception](32)
+    s2c_send, s2c_recv = anyio.create_memory_object_stream[SessionMessage | Exception](32)
+    client: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(s2c_recv, c2s_send)
+    on_request, on_notify = echo_handlers(Recorder())
+    seen: list[tuple[float, float | None]] = []
+    try:
+        async with anyio.create_task_group() as tg:
+            await tg.start(client.run, on_request, on_notify)
+            with anyio.fail_after(5):
+
+                async def respond_with_bool_then_numeric_total() -> None:
+                    out = await c2s_recv.receive()
+                    assert isinstance(out, SessionMessage)
+                    assert isinstance(out.message, JSONRPCRequest)
+                    rid = out.message.id
+                    for params in (
+                        {"progressToken": rid, "progress": 0.5, "total": True},
+                        {"progressToken": rid, "progress": 0.6, "total": False},
+                        {"progressToken": rid, "progress": 0.75, "total": 2},
+                    ):
+                        await s2c_send.send(
+                            SessionMessage(
+                                message=JSONRPCNotification(
+                                    jsonrpc="2.0", method="notifications/progress", params=params
+                                )
+                            )
+                        )
+                    await s2c_send.send(
+                        SessionMessage(message=JSONRPCResponse(jsonrpc="2.0", id=rid, result={"ok": True}))
+                    )
+
+                async def on_progress(progress: float, total: float | None, message: str | None) -> None:
+                    seen.append((progress, total))
+
+                tg.start_soon(respond_with_bool_then_numeric_total)
+                result = await client.send_raw_request("ping", None, {"on_progress": on_progress})
+                assert result == {"ok": True}
+            tg.cancel_scope.cancel()
+    finally:
+        for s in (c2s_send, c2s_recv, s2c_send, s2c_recv):
+            s.close()
+    assert seen == [(0.5, None), (0.6, None), (0.75, 2.0)]
+
+
+@pytest.mark.anyio
 async def test_request_with_bool_meta_progress_token_is_not_adopted():
     """A bool `_meta.progressToken` is malformed: `ctx.progress()` must be a no-op, not emit `progressToken: true`."""
     c2s_send, c2s_recv = anyio.create_memory_object_stream[SessionMessage | Exception](32)
