@@ -12,26 +12,40 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
 
 import anyio
-import httpx
+import httpx2
 import pytest
 from inline_snapshot import snapshot
 from mcp_types import (
     CLIENT_CAPABILITIES_META_KEY,
     CLIENT_INFO_META_KEY,
+    CONNECTION_CLOSED,
+    INVALID_REQUEST,
     METHOD_NOT_FOUND,
     PROTOCOL_VERSION_META_KEY,
     JSONRPCError,
     JSONRPCNotification,
     JSONRPCRequest,
     JSONRPCResponse,
+    ListToolsResult,
+    PaginatedRequestParams,
 )
 from mcp_types.version import LATEST_MODERN_VERSION
+from starlette.applications import Starlette
+from starlette.routing import Mount
 from starlette.types import Receive, Scope, Send
 
-from mcp.client.streamable_http import streamable_http_client
-from mcp.server import Server
+from mcp import Client, MCPError
+from mcp.client.streamable_http import (
+    MAX_RECONNECTION_ATTEMPTS,
+    RequestContext,
+    StreamableHTTPTransport,
+    streamable_http_client,
+)
+from mcp.server import Server, ServerRequestContext
 from mcp.server._streamable_http_modern import handle_modern_request
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.subscriptions import InMemorySubscriptionBus, ListenHandler, ServerEvent
+from mcp.shared._context_streams import ContextSendStream, create_context_streams
 from mcp.shared.dispatcher import CallOptions, DispatchContext
 from mcp.shared.inbound import MCP_METHOD_HEADER, MCP_PROTOCOL_VERSION_HEADER, encode_header_value
 from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
@@ -77,16 +91,16 @@ def test_mcp_name_header_values_are_base64_wrapped_when_unsafe_for_an_http_field
 async def test_post_request_merges_per_message_metadata_headers() -> None:
     """`ClientMessageMetadata.headers` on a `SessionMessage` are merged into the outgoing POST headers
     (SDK-defined: the headers sidecar is the path the session uses to reach the transport)."""
-    recorded: list[httpx.Request] = []
+    recorded: list[httpx2.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         recorded.append(request)
         body = json.loads(request.content)
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {}})
+        return httpx2.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {}})
 
     with anyio.fail_after(5):
         async with (
-            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
             streamable_http_client("http://test/mcp", http_client=http) as (read, write),
         ):
             await write.send(
@@ -109,12 +123,12 @@ async def test_pre_session_bare_404_maps_to_method_not_found() -> None:
     "Session terminated" is meaningless, and the discover→initialize fallback ladder keys on -32601.
     """
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404)
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(404)
 
     with anyio.fail_after(5):
         async with (
-            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
             streamable_http_client("http://test/mcp", http_client=http) as (read, write),
         ):
             await write.send(SessionMessage(JSONRPCRequest(jsonrpc="2.0", id=1, method="server/discover", params={})))
@@ -137,18 +151,18 @@ async def test_initialize_post_clears_cached_pv_header_and_unstamped_posts_read_
        passes through the session's stamp) then reads the cache and carries the
        negotiated version — the spec MUST for all post-initialization HTTP requests.
     """
-    recorded: list[httpx.Request] = []
+    recorded: list[httpx2.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         recorded.append(request)
         body = json.loads(request.content)
         if "id" not in body or "result" in body:
-            return httpx.Response(202)
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {}})
+            return httpx2.Response(202)
+        return httpx2.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {}})
 
     with anyio.fail_after(5):
         async with (
-            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
             streamable_http_client("http://test/mcp", http_client=http) as (read, write),
         ):
             await write.send(
@@ -177,11 +191,11 @@ async def test_initialize_post_clears_cached_pv_header_and_unstamped_posts_read_
     assert recorded[3].headers[MCP_PROTOCOL_VERSION_HEADER] == "2025-11-25"
 
 
-class _ParkedSSEStream(httpx.AsyncByteStream):
+class _ParkedSSEStream(httpx2.AsyncByteStream):
     """An SSE response body that emits one comment line, then parks until closed.
 
     `opened` fires once the transport is iterating the body (the POST is truly in
-    flight); `closed` fires when httpx tears the body down — the observable proof
+    flight); `closed` fires when httpx2 tears the body down — the observable proof
     that an abort, not a response, ended the stream.
     """
 
@@ -202,16 +216,16 @@ class _ParkedSSEStream(httpx.AsyncByteStream):
 
 def _sse_or_ack_handler(
     parked: _ParkedSSEStream, posted: list[dict[str, Any]], frame_posted: anyio.Event
-) -> Callable[[httpx.Request], httpx.Response]:
+) -> Callable[[httpx2.Request], httpx2.Response]:
     """Requests get the parked SSE body; notifications get 202 and set `frame_posted`."""
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         body = json.loads(request.content)
         posted.append(body)
         if "id" in body:
-            return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=parked)
+            return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=parked)
         frame_posted.set()
-        return httpx.Response(202)
+        return httpx2.Response(202)
 
     return handler
 
@@ -224,13 +238,13 @@ async def test_modern_cancelled_frame_aborts_the_matching_in_flight_post() -> No
     parked = _ParkedSSEStream()
     posted: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         posted.append(json.loads(request.content))
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=parked)
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=parked)
 
     with anyio.fail_after(5):
         async with (
-            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
             streamable_http_client("http://test/mcp", http_client=http) as (_read, write),
         ):
             await write.send(
@@ -264,7 +278,7 @@ async def test_legacy_cancelled_frame_posts_and_leaves_the_stream_open(stamped_v
 
     with anyio.fail_after(5):
         async with (
-            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
             streamable_http_client("http://test/mcp", http_client=http) as (_read, write),
         ):
             metadata = (
@@ -308,16 +322,16 @@ async def test_modern_cancelled_frames_matching_no_post_are_swallowed(params: di
     parked = _ParkedSSEStream()
     posted: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         body = json.loads(request.content)
         posted.append(body)
         if body.get("id") == 1:
-            return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=parked)
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {}})
+            return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=parked)
+        return httpx2.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {}})
 
     with anyio.fail_after(5):
         async with (
-            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
             streamable_http_client("http://test/mcp", http_client=http) as (read, write),
         ):
             await write.send(
@@ -354,7 +368,7 @@ async def test_handler_scoped_cancelled_frames_are_translated_at_modern_too() ->
 
     with anyio.fail_after(5):
         async with (
-            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
             streamable_http_client("http://test/mcp", http_client=http) as (_read, write),
         ):
             await write.send(
@@ -387,19 +401,19 @@ async def test_cancel_for_a_request_sent_under_2025_still_posts_after_modern_ado
     posted: list[dict[str, Any]] = []
     frame_posted = anyio.Event()
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         body = json.loads(request.content)
         posted.append(body)
         if body.get("id") == 1:
-            return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=parked)
+            return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=parked)
         if "id" in body:
-            return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {}})
+            return httpx2.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {}})
         frame_posted.set()
-        return httpx.Response(202)
+        return httpx2.Response(202)
 
     with anyio.fail_after(5):
         async with (
-            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
             streamable_http_client("http://test/mcp", http_client=http) as (read, write),
         ):
             await write.send(
@@ -464,7 +478,7 @@ async def test_scope_cancel_aborts_a_modern_listen_post_end_to_end() -> None:
 
     posted_methods: list[str] = []
 
-    async def record_request(request: httpx.Request) -> None:
+    async def record_request(request: httpx2.Request) -> None:
         posted_methods.append(json.loads(request.content)["method"])
 
     acked = anyio.Event()
@@ -477,7 +491,7 @@ async def test_scope_cancel_aborts_a_modern_listen_post_end_to_end() -> None:
 
     with anyio.fail_after(15):
         async with (
-            httpx.AsyncClient(
+            httpx2.AsyncClient(
                 transport=StreamingASGITransport(app),
                 base_url="http://testserver",
                 event_hooks={"request": [record_request]},
@@ -518,7 +532,7 @@ async def test_scope_cancel_aborts_a_modern_listen_post_end_to_end() -> None:
     assert posted_methods == ["subscriptions/listen"]
 
 
-class _CompletingSSEStream(httpx.AsyncByteStream):
+class _CompletingSSEStream(httpx2.AsyncByteStream):
     """An SSE body that delivers one JSON-RPC response, then parks in `aclose`.
 
     Holding `aclose` keeps the finished POST task alive past its response, so a
@@ -546,13 +560,13 @@ async def test_a_finished_post_task_does_not_evict_a_reused_ids_new_registration
     posted: list[dict[str, Any]] = []
     streams = [completing, parked]
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         posted.append(json.loads(request.content))
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=streams.pop(0))
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=streams.pop(0))
 
     with anyio.fail_after(5):
         async with (
-            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
             streamable_http_client("http://test/mcp", http_client=http) as (read, write),
         ):
             modern = ClientMessageMetadata(headers={MCP_PROTOCOL_VERSION_HEADER: LATEST_MODERN_VERSION})
@@ -583,3 +597,374 @@ async def test_a_finished_post_task_does_not_evict_a_reused_ids_new_registration
             )
             await parked.closed.wait()
     assert [body["method"] for body in posted] == ["tools/call", "subscriptions/listen"]
+
+
+class _DyingSSEStream(httpx2.AsyncByteStream):
+    """Emits one id-less comment then breaks - a non-resumable stream dropping."""
+
+    def __init__(self) -> None:
+        self.opened = anyio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.opened.set()
+        yield b": hello\n\n"
+        raise httpx2.ReadError("connection reset")
+
+    async def aclose(self) -> None:
+        pass
+
+
+@pytest.mark.anyio
+async def test_a_non_resumable_sse_drop_resolves_the_request_with_an_error() -> None:
+    """A per-request SSE stream that dies having carried no event ids can never deliver its
+    response; the transport resolves the waiter with CONNECTION_CLOSED instead of hanging forever."""
+    dying = _DyingSSEStream()
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=dying)
+
+    with anyio.fail_after(5):
+        async with (
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
+            streamable_http_client("http://test/mcp", http_client=http) as (read, write),
+        ):
+            await write.send(
+                SessionMessage(JSONRPCRequest(jsonrpc="2.0", id="listen-1", method="subscriptions/listen", params={}))
+            )
+            reply = await read.receive()
+    assert isinstance(reply, SessionMessage)
+    assert isinstance(reply.message, JSONRPCError)
+    assert reply.message.id == "listen-1"
+    assert reply.message.error.code == CONNECTION_CLOSED
+
+
+class _DeliverOnCommandSSEStream(httpx2.AsyncByteStream):
+    """Parks after opening, then delivers one JSON-RPC response when told."""
+
+    def __init__(self, response_body: dict[str, Any]) -> None:
+        self._event = f"data: {json.dumps(response_body)}\n\n".encode()
+        self.opened = anyio.Event()
+        self.deliver = anyio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.opened.set()
+        await self.deliver.wait()
+        yield self._event
+
+    async def aclose(self) -> None:
+        pass
+
+
+@pytest.mark.anyio
+async def test_a_superseded_posts_late_real_response_cannot_answer_the_successor() -> None:
+    """SDK-defined: re-issuing an id severs the superseded POST, so nothing from its
+    stream (a late real response, or a synthesized error for its death) can resolve
+    the reused id's waiter; only the successor's own response arrives."""
+    stale = _DeliverOnCommandSSEStream({"jsonrpc": "2.0", "id": "dup-1", "result": {"origin": "stale"}})
+    succeeding = _DeliverOnCommandSSEStream({"jsonrpc": "2.0", "id": "dup-1", "result": {"origin": "fresh"}})
+    streams: list[httpx2.AsyncByteStream] = [stale, succeeding]
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=streams.pop(0))
+
+    with anyio.fail_after(5):
+        async with (
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
+            streamable_http_client("http://test/mcp", http_client=http) as (read, write),
+        ):
+            await write.send(SessionMessage(JSONRPCRequest(jsonrpc="2.0", id="dup-1", method="tools/call", params={})))
+            await stale.opened.wait()
+            await write.send(SessionMessage(JSONRPCRequest(jsonrpc="2.0", id="dup-1", method="tools/call", params={})))
+            await succeeding.opened.wait()
+            stale.deliver.set()
+            await anyio.wait_all_tasks_blocked()
+            succeeding.deliver.set()
+            reply = await read.receive()
+    assert isinstance(reply, SessionMessage)
+    assert isinstance(reply.message, JSONRPCResponse), reply.message
+    assert reply.message.result == {"origin": "fresh"}
+
+
+@pytest.mark.anyio
+async def test_a_202_to_a_request_resolves_the_waiter_with_an_error() -> None:
+    """SDK-defined: a server that answers a request with 202 Accepted has declared no
+    response will follow (the spec requires SSE or JSON for requests); the transport
+    resolves the waiter with INVALID_REQUEST instead of parking the caller forever."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(202)
+
+    with anyio.fail_after(5):
+        async with (
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
+            streamable_http_client("http://test/mcp", http_client=http) as (read, write),
+        ):
+            await write.send(
+                SessionMessage(JSONRPCRequest(jsonrpc="2.0", id="listen-1", method="subscriptions/listen", params={}))
+            )
+            reply = await read.receive()
+    assert isinstance(reply, SessionMessage)
+    assert isinstance(reply.message, JSONRPCError)
+    assert reply.message.id == "listen-1"
+    assert reply.message.error.code == INVALID_REQUEST
+
+
+def _abandoned_request_context(
+    http: httpx2.AsyncClient, send: ContextSendStream[SessionMessage | Exception]
+) -> RequestContext:
+    return RequestContext(
+        client=http,
+        session_id=None,
+        session_message=SessionMessage(
+            JSONRPCRequest(jsonrpc="2.0", id="listen-1", method="subscriptions/listen", params={})
+        ),
+        metadata=None,
+        read_stream_writer=send,
+    )
+
+
+@pytest.mark.anyio
+async def test_exhausted_reconnection_attempts_resolve_the_request_with_an_error() -> None:
+    """An id-bearing stream that exhausts its reconnection budget also resolves the waiter with CONNECTION_CLOSED."""
+    transport = StreamableHTTPTransport("http://test/mcp")
+    send, receive = create_context_streams[SessionMessage | Exception](1)
+    async with httpx2.AsyncClient() as http:
+        with anyio.fail_after(5):
+            await transport._handle_reconnection(  # pyright: ignore[reportPrivateUsage]
+                _abandoned_request_context(http, send), "evt-7", None, MAX_RECONNECTION_ATTEMPTS
+            )
+            reply = await receive.receive()
+    assert isinstance(reply, SessionMessage)
+    assert isinstance(reply.message, JSONRPCError)
+    assert reply.message.id == "listen-1"
+    assert reply.message.error.code == CONNECTION_CLOSED
+    send.close()
+    receive.close()
+
+
+@pytest.mark.anyio
+async def test_resolving_an_abandoned_request_after_the_reader_closed_is_contained() -> None:
+    """Teardown race: a stream dying after the reader closed resolves best-effort and must not crash."""
+    transport = StreamableHTTPTransport("http://test/mcp")
+    send, receive = create_context_streams[SessionMessage | Exception](1)
+    receive.close()
+    async with httpx2.AsyncClient() as http:
+        with anyio.fail_after(5):
+            await transport._handle_reconnection(  # pyright: ignore[reportPrivateUsage]
+                _abandoned_request_context(http, send), "evt-7", None, MAX_RECONNECTION_ATTEMPTS
+            )
+    send.close()
+
+
+@pytest.mark.anyio
+async def test_trailing_slash_redirect_within_origin_is_followed_by_the_transport() -> None:
+    """SDK-defined: a redirect that stays on the endpoint's origin (here Starlette's Mount sending
+    /mcp to /mcp/) is followed by the transport itself, so a caller-supplied client left at
+    httpx2's no-follow default still connects."""
+    session_manager = StreamableHTTPSessionManager(app=Server("redirect-test"))
+    app = Starlette(routes=[Mount("/mcp", app=session_manager.handle_request)])
+    urls: list[str] = []
+
+    async def record(request: httpx2.Request) -> None:
+        urls.append(str(request.url))
+
+    with anyio.fail_after(5):
+        async with (
+            session_manager.run(),
+            httpx2.AsyncClient(transport=StreamingASGITransport(app), event_hooks={"request": [record]}) as http,
+            Client(streamable_http_client("http://mcp.example/mcp", http_client=http)) as client,
+        ):
+            assert client.server_info is not None
+            assert client.server_info.name == "redirect-test"
+
+    assert urls[:2] == ["http://mcp.example/mcp", "http://mcp.example/mcp/"]
+
+
+class _RedirectPromptsListElsewhere(httpx2.AsyncBaseTransport):
+    """Serves `app` in process, except that a prompts/list POST is answered with a redirect to
+    another origin."""
+
+    def __init__(self, app: Starlette) -> None:
+        self.inner = StreamingASGITransport(app)
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        await request.aread()
+        if request.method == "POST" and json.loads(request.content).get("method") == "prompts/list":
+            return httpx2.Response(307, headers={"location": "http://other.example/mcp/"})
+        return await self.inner.handle_async_request(request)
+
+    async def __aenter__(self) -> "_RedirectPromptsListElsewhere":
+        await self.inner.__aenter__()
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self.inner.__aexit__(*args)
+
+
+@pytest.mark.anyio
+async def test_redirect_to_another_origin_fails_that_call_and_keeps_the_session() -> None:
+    """SDK-defined: a redirect pointing outside the endpoint's origin is not followed, whatever the
+    caller's client is configured to do: the call it answered fails with MCPError naming the
+    location, nothing is sent to the other origin, and the session stays usable."""
+
+    async def list_tools(ctx: ServerRequestContext, params: PaginatedRequestParams | None) -> ListToolsResult:
+        return ListToolsResult(tools=[])
+
+    session_manager = StreamableHTTPSessionManager(app=Server("redirect-test", on_list_tools=list_tools))
+    app = Starlette(routes=[Mount("/mcp", app=session_manager.handle_request)])
+    urls: list[str] = []
+
+    async def record(request: httpx2.Request) -> None:
+        urls.append(str(request.url))
+
+    with anyio.fail_after(5):
+        async with (
+            session_manager.run(),
+            httpx2.AsyncClient(
+                transport=_RedirectPromptsListElsewhere(app), event_hooks={"request": [record]}, follow_redirects=True
+            ) as http,
+            Client(streamable_http_client("http://mcp.example/mcp/", http_client=http)) as client,
+        ):
+            with pytest.raises(MCPError) as exc_info:
+                await client.list_prompts()
+            assert (await client.list_tools()).tools == []
+
+    assert exc_info.value.error.code == INVALID_REQUEST
+    assert exc_info.value.error.message == snapshot(
+        "Redirect to http://other.example/mcp/ not followed; use that URL as the endpoint if it is the intended server"
+    )
+    assert [url for url in urls if "other.example" in url] == []
+
+
+@pytest.mark.anyio
+async def test_redirected_notification_is_dropped_and_the_next_message_still_goes_out() -> None:
+    """SDK-defined: a notification whose POST is redirected outside the origin has no waiter to
+    resolve, so it is logged and dropped; the transport keeps serving the write stream."""
+    urls: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        urls.append(str(request.url))
+        return httpx2.Response(307, headers={"location": "http://other.example/mcp"})
+
+    with anyio.fail_after(5):
+        async with (
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
+            streamable_http_client("http://test/mcp", http_client=http) as (read, write),
+        ):
+            await write.send(
+                SessionMessage(JSONRPCNotification(jsonrpc="2.0", method="notifications/roots/list_changed"))
+            )
+            await write.send(SessionMessage(JSONRPCRequest(jsonrpc="2.0", id=7, method="tools/list", params={})))
+            reply = await read.receive()
+    assert isinstance(reply, SessionMessage)
+    assert isinstance(reply.message, JSONRPCError)
+    assert reply.message.id == 7
+    assert reply.message.error.code == INVALID_REQUEST
+    assert urls == ["http://test/mcp", "http://test/mcp"]
+
+
+@pytest.mark.anyio
+async def test_get_stream_gives_up_without_retrying_when_the_endpoint_redirects_elsewhere() -> None:
+    """SDK-defined: the standalone GET stream is not opened through a redirect to another origin,
+    and since the same GET would be redirected again the transport logs it and stops instead of
+    spending its reconnection attempts."""
+    gets: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        gets.append(str(request.url))
+        return httpx2.Response(307, headers={"location": "http://other.example/mcp"})
+
+    transport = StreamableHTTPTransport("http://test/mcp")
+    transport.session_id = "session-1"
+    send, receive = create_context_streams[SessionMessage | Exception](1)
+    with anyio.fail_after(5):
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http:
+            await transport.handle_get_stream(http, send)
+    assert gets == ["http://test/mcp"]
+    send.close()
+    receive.close()
+
+
+@pytest.mark.anyio
+async def test_resumption_redirected_elsewhere_resolves_that_request_with_an_error() -> None:
+    """SDK-defined: a resumption GET answered with a redirect to another origin is not followed;
+    the resumed request is resolved with an error naming the location rather than left waiting."""
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append((f"{request.method} {request.url}", request.headers.get("last-event-id")))
+        return httpx2.Response(307, headers={"location": "http://other.example/mcp"})
+
+    with anyio.fail_after(5):
+        async with (
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
+            streamable_http_client("http://test/mcp", http_client=http) as (read, write),
+        ):
+            await write.send(
+                SessionMessage(
+                    JSONRPCRequest(jsonrpc="2.0", id="resume-1", method="tools/call", params={}),
+                    metadata=ClientMessageMetadata(resumption_token="evt-41"),
+                )
+            )
+            reply = await read.receive()
+    assert isinstance(reply, SessionMessage)
+    assert isinstance(reply.message, JSONRPCError)
+    assert reply.message.id == "resume-1"
+    assert reply.message.error.code == INVALID_REQUEST
+    assert reply.message.error.message == snapshot(
+        "Redirect to http://other.example/mcp not followed; use that URL as the endpoint if it is the intended server"
+    )
+    assert seen == [("GET http://test/mcp", "evt-41")]
+
+
+async def _redirected_call_error(url: str, location: str) -> str:
+    """Send one request through streamable_http_client to a server answering `url` with a 307 to
+    `location`, and return the message of the error that resolves it."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(307, headers={"location": location})
+
+    with anyio.fail_after(5):
+        async with (
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
+            streamable_http_client(url, http_client=http) as (read, write),
+        ):
+            await write.send(SessionMessage(JSONRPCRequest(jsonrpc="2.0", id=1, method="tools/list", params={})))
+            reply = await read.receive()
+    assert isinstance(reply, SessionMessage)
+    assert isinstance(reply.message, JSONRPCError)
+    return reply.message.error.message
+
+
+@pytest.mark.anyio
+async def test_https_endpoint_redirected_to_plain_http_is_explained_and_the_https_form_suggested() -> None:
+    """SDK-authored text: a redirect of an HTTPS endpoint to plain HTTP on the same host (the usual
+    sign of a TLS-terminating proxy the server does not trust) never suggests the http:// URL."""
+    message = await _redirected_call_error("https://mcp.example/mcp", "http://mcp.example/mcp/")
+    assert message == snapshot("""\
+Redirect to http://mcp.example/mcp/ not followed: it would downgrade this HTTPS endpoint to plain HTTP.
+The server is likely behind a TLS-terminating proxy whose forwarded headers it does not trust,
+often combined with a trailing-slash difference. Try https://mcp.example/mcp/ instead, or fix the proxy settings.\
+""")
+
+
+@pytest.mark.anyio
+async def test_unfollowed_redirect_location_is_named_without_its_query_string() -> None:
+    """SDK-authored text: the location is reported without query or userinfo, which may carry state
+    that does not belong in an error message or a log line."""
+    message = await _redirected_call_error("http://mcp.example/mcp", "https://sso.example/login?state=s3cr3t&nonce=n")
+    assert message == snapshot(
+        "Redirect to https://sso.example/login not followed; use that URL as the endpoint if it is the intended server"
+    )
+
+
+@pytest.mark.anyio
+async def test_https_endpoint_redirected_to_plain_http_elsewhere_never_suggests_the_http_url() -> None:
+    """SDK-authored text: the downgrade explanation applies whatever host the http:// location names,
+    so the message never offers a plain-HTTP URL as the endpoint to configure."""
+    message = await _redirected_call_error("https://mcp.example/mcp", "http://backend.lan:8000/mcp/")
+    assert message == snapshot("""\
+Redirect to http://backend.lan:8000/mcp/ not followed: it would downgrade this HTTPS endpoint to plain HTTP.
+The server is likely behind a TLS-terminating proxy whose forwarded headers it does not trust,
+often combined with a trailing-slash difference. Try https://backend.lan:8000/mcp/ instead, or fix the proxy settings.\
+""")

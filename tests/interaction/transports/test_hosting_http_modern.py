@@ -12,7 +12,7 @@ from collections.abc import Callable
 from typing import Any, Literal
 
 import anyio
-import httpx
+import httpx2
 import pytest
 from inline_snapshot import snapshot
 from mcp_types import (
@@ -20,12 +20,15 @@ from mcp_types import (
     HEADER_MISMATCH,
     INTERNAL_ERROR,
     INVALID_PARAMS,
+    INVALID_REQUEST,
     METHOD_NOT_FOUND,
     MISSING_REQUIRED_CLIENT_CAPABILITY,
+    SERVER_INFO_META_KEY,
     CallToolRequestParams,
     CallToolResult,
     DiscoverResult,
     EmptyResult,
+    ErrorData,
     Implementation,
     JSONRPCError,
     JSONRPCResponse,
@@ -77,7 +80,11 @@ def _meta_envelope() -> dict[str, object]:
 
 
 def _server(*, on_meta: Callable[[dict[str, Any]], None] | None = None) -> Server:
-    """A low-level server with one ``add`` tool for the raw-httpx tests below."""
+    """A low-level server with one `add` tool for the raw-httpx2 tests below.
+
+    The explicit version gives the `_meta` serverInfo stamp every 2026 result
+    carries a non-empty value for the wire-level snapshots.
+    """
 
     async def list_tools(ctx: ServerRequestContext, params: PaginatedRequestParams | None) -> ListToolsResult:
         tool = Tool(name="add", input_schema={"type": "object"})
@@ -91,7 +98,7 @@ def _server(*, on_meta: Callable[[dict[str, Any]], None] | None = None) -> Serve
             on_meta(dict(ctx.meta))
         return CallToolResult(content=[TextContent(text=str(params.arguments["a"] + params.arguments["b"]))])
 
-    return Server("modern", on_list_tools=list_tools, on_call_tool=call_tool)
+    return Server("modern", version="1.0.0", on_list_tools=list_tools, on_call_tool=call_tool)
 
 
 @requirement("hosting:http:modern:tools-call-stateless")
@@ -99,9 +106,10 @@ async def test_modern_tools_call_returns_result_type_complete_without_initialize
     """A 2026-07-28 tools/call is served without an initialize handshake and returns resultType: complete.
 
     Spec-mandated under the draft transport: the per-request ``_meta`` envelope replaces initialize,
-    and ``resultType`` is the 2026 result-envelope discriminator (``complete`` for the monolith
-    result). Asserted at the wire because the SDK client never surfaces ``resultType`` and because
-    the absence of any prior request on the connection is the assertion.
+    `resultType` is the 2026 result-envelope discriminator (`complete` for the monolith
+    result), and the server identifies itself via the result `_meta` serverInfo stamp. Asserted at
+    the wire because the SDK client never surfaces `resultType` and because the absence of any
+    prior request on the connection is the assertion.
     """
     body = {
         "jsonrpc": "2.0",
@@ -117,7 +125,12 @@ async def test_modern_tools_call_returns_result_type_complete_without_initialize
     parsed = JSONRPCResponse.model_validate(response.json())
     assert parsed.id == 1
     assert parsed.result == snapshot(
-        {"content": [{"text": "5", "type": "text"}], "isError": False, "resultType": "complete"}
+        {
+            "content": [{"text": "5", "type": "text"}],
+            "isError": False,
+            "resultType": "complete",
+            "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "modern", "version": "1.0.0"}},
+        }
     )
 
 
@@ -140,6 +153,39 @@ async def test_modern_response_carries_no_session_id_header() -> None:
 
     assert response.status_code == 200
     assert "mcp-session-id" not in response.headers
+
+
+@requirement("hosting:http:modern:notification-post-202")
+@pytest.mark.parametrize("json_response", [True, False], ids=["json", "sse"])
+@pytest.mark.parametrize("stateless_http", [True, False], ids=["stateless-flag", "default"])
+async def test_modern_notification_post_is_acknowledged_202_and_a_posted_response_is_rejected(
+    json_response: bool, stateless_http: bool
+) -> None:
+    """A 2026-07-28 notification POST is answered 202 with no body; a posted response is 400 INVALID_REQUEST.
+
+    Spec-permitted (streamable-http §Sending Messages item 5): the server may accept (202) or refuse
+    (4xx) a notification POST, and the SDK accepts -- the same answer the legacy leg gives, so a
+    client's courtesy `notifications/cancelled` is not met with an error on one era only.
+    Spec-mandated (item 4): clients MUST NOT post responses, so one is refused. Driven through the
+    mounted app so the manager's header routing is in the path, under both response modes and both
+    values of the legacy-only `stateless_http` flag (neither is read before the modern entry answers).
+    """
+    notification = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}
+    posted_response: dict[str, Any] = {"jsonrpc": "2.0", "id": 1, "result": {}}
+    async with mounted_app(_server(), json_response=json_response, stateless_http=stateless_http) as (http, _):
+        acknowledged = await http.post(
+            "/mcp", json=notification, headers=_modern_headers(method="notifications/cancelled")
+        )
+        refused = await http.post("/mcp", json=posted_response, headers=_modern_headers(method="tools/list"))
+
+    assert (acknowledged.status_code, acknowledged.content) == (202, b"")
+    assert "mcp-session-id" not in acknowledged.headers
+    assert refused.status_code == 400
+    assert JSONRPCError.model_validate(refused.json()) == JSONRPCError(
+        jsonrpc="2.0",
+        id=None,
+        error=ErrorData(code=INVALID_REQUEST, message="Body must be a single JSON-RPC request or notification object"),
+    )
 
 
 @requirement("hosting:http:modern:initialize-removed")
@@ -213,12 +259,13 @@ async def test_modern_handler_exception_maps_to_internal_error_without_leaking_t
 
 @requirement("hosting:http:modern:discover-response-shape")
 async def test_modern_server_discover_returns_capabilities_and_supported_versions() -> None:
-    """A 2026-07-28 server/discover POST returns capabilities, serverInfo, and supportedVersions.
+    """A 2026-07-28 server/discover POST returns capabilities and supportedVersions, with serverInfo in `_meta`.
 
     Spec-mandated under the draft: server/discover is the 2026 advertisement method that replaces
     the initialize-response payload, and ``supportedVersions`` is the field a client picks its
-    per-request envelope version from. Asserted at the wire because the SDK client never exposes
-    the raw result body.
+    per-request envelope version from. The server's identity is no longer a result-body field: it
+    travels as the io.modelcontextprotocol/serverInfo result `_meta` stamp. Asserted at the wire
+    because the SDK client never exposes the raw result body.
     """
     body = {"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {"_meta": _meta_envelope()}}
     async with mounted_app(_server()) as (http, _):
@@ -227,7 +274,8 @@ async def test_modern_server_discover_returns_capabilities_and_supported_version
     assert response.status_code == 200
     result = JSONRPCResponse.model_validate(response.json()).result
     assert result["supportedVersions"] == snapshot(["2026-07-28"])
-    assert result["serverInfo"]["name"] == "modern"
+    assert "serverInfo" not in result
+    assert result["_meta"][SERVER_INFO_META_KEY] == {"name": "modern", "version": "1.0.0"}
     assert "capabilities" in result
 
 
@@ -282,7 +330,7 @@ async def test_modern_handler_raised_mcperror_maps_to_status_via_error_code_tabl
         raise MCPError(
             code=MISSING_REQUIRED_CLIENT_CAPABILITY,
             message="sampling required",
-            data={"requiredCapabilities": ["sampling"]},
+            data={"requiredCapabilities": {"sampling": {}}},
         )
 
     server = _server()
@@ -294,7 +342,7 @@ async def test_modern_handler_raised_mcperror_maps_to_status_via_error_code_tabl
     assert response.status_code == 400
     error = JSONRPCError.model_validate(response.json()).error
     assert error.code == MISSING_REQUIRED_CLIENT_CAPABILITY
-    assert error.data == {"requiredCapabilities": ["sampling"]}
+    assert error.data == {"requiredCapabilities": {"sampling": {}}}
 
 
 @requirement("hosting:http:modern:tools-call-stateless")
@@ -311,7 +359,7 @@ async def test_pinned_client_stateless_tools_call_round_trips_against_the_modern
     plus the three-key ``io.modelcontextprotocol/*`` ``_meta`` envelope. The caller passes a
     ``custom-key`` under ``meta=`` and the server handler captures the incoming ``ctx.meta``,
     proving the envelope merge is additive: the caller's key sits alongside the three envelope keys
-    on the wire and inside the handler. Asserted at the wire via the ``mounted_app`` httpx event
+    on the wire and inside the handler. Asserted at the wire via the ``mounted_app`` httpx2 event
     hooks because none of the headers, the envelope, or the handshake-absence is observable through
     the public client API. The recorded log shows two POSTs: the ``tools/call`` itself and the
     client's implicit ``tools/list`` output-schema fetch (see ``client:output-schema:auto-list``),
@@ -320,13 +368,13 @@ async def test_pinned_client_stateless_tools_call_round_trips_against_the_modern
     observed_metas: list[dict[str, Any]] = []
     server = _server(on_meta=observed_metas.append)
 
-    requests: list[httpx.Request] = []
-    responses: list[httpx.Response] = []
+    requests: list[httpx2.Request] = []
+    responses: list[httpx2.Response] = []
 
-    async def on_request(request: httpx.Request) -> None:
+    async def on_request(request: httpx2.Request) -> None:
         requests.append(request)
 
-    async def on_response(response: httpx.Response) -> None:
+    async def on_response(response: httpx2.Response) -> None:
         responses.append(response)
 
     client_info = Implementation(name="e2e-client", version="1.0.0")
@@ -340,7 +388,6 @@ async def test_pinned_client_stateless_tools_call_round_trips_against_the_modern
                 DiscoverResult(
                     supported_versions=[LATEST_MODERN_VERSION],
                     capabilities=ServerCapabilities(),
-                    server_info=Implementation(name="srv", version="0"),
                 )
             )
             result = await session.call_tool(
@@ -350,7 +397,12 @@ async def test_pinned_client_stateless_tools_call_round_trips_against_the_modern
             )
 
     assert result.model_dump(by_alias=True, mode="json", exclude_none=True) == snapshot(
-        {"content": [{"type": "text", "text": "5"}], "isError": False, "resultType": "complete"}
+        {
+            "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "modern", "version": "1.0.0"}},
+            "content": [{"type": "text", "text": "5"}],
+            "isError": False,
+            "resultType": "complete",
+        }
     )
 
     # Exactly the tools/call POST and the implicit tools/list POST -- no initialize, no
@@ -432,15 +484,14 @@ async def test_modern_client_mirrors_x_mcp_header_args_into_mcp_param_headers() 
     `verbose`-sibling stay out of the headers, and every mirrored value remains in the request body. Asserted
     at the wire because the client never surfaces the outgoing headers.
     """
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    async def on_request(request: httpx.Request) -> None:
+    async def on_request(request: httpx2.Request) -> None:
         requests.append(request)
 
     discover = DiscoverResult(
         supported_versions=[LATEST_MODERN_VERSION],
         capabilities=ServerCapabilities(),
-        server_info=Implementation(name="srv", version="0"),
     )
     with anyio.fail_after(5):
         async with (
@@ -479,15 +530,14 @@ async def test_modern_client_emits_no_param_headers_for_an_unlisted_tool() -> No
     The server validates `Mcp-Param-*` against its own catalog and rejects as the spec's scenario table
     requires for an omitted header (the relist-and-retry recovery is a SHOULD the client does not implement yet).
     """
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    async def on_request(request: httpx.Request) -> None:
+    async def on_request(request: httpx2.Request) -> None:
         requests.append(request)
 
     discover = DiscoverResult(
         supported_versions=[LATEST_MODERN_VERSION],
         capabilities=ServerCapabilities(),
-        server_info=Implementation(name="srv", version="0"),
     )
     with anyio.fail_after(5):
         async with (
@@ -532,16 +582,15 @@ async def test_modern_client_stops_mirroring_after_a_re_list_drops_the_tool() ->
 
     server = Server("evict", on_list_tools=list_tools, on_call_tool=call_tool)
 
-    tool_calls: list[httpx.Request] = []
+    tool_calls: list[httpx2.Request] = []
 
-    async def on_request(request: httpx.Request) -> None:
+    async def on_request(request: httpx2.Request) -> None:
         if json.loads(request.content)["method"] == "tools/call":
             tool_calls.append(request)
 
     discover = DiscoverResult(
         supported_versions=[LATEST_MODERN_VERSION],
         capabilities=ServerCapabilities(),
-        server_info=Implementation(name="srv", version="0"),
     )
     with anyio.fail_after(5):
         async with (
@@ -588,15 +637,14 @@ async def test_vendor_request_with_name_param_carries_mcp_name_on_the_wire() -> 
     server = _server()
     server.add_request_handler("com.example/jobs.status", _JobParams, job_status)
 
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    async def on_request(request: httpx.Request) -> None:
+    async def on_request(request: httpx2.Request) -> None:
         requests.append(request)
 
     discover = DiscoverResult(
         supported_versions=[LATEST_MODERN_VERSION],
         capabilities=ServerCapabilities(),
-        server_info=Implementation(name="srv", version="0"),
     )
     with anyio.fail_after(5):
         async with (

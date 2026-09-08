@@ -40,7 +40,7 @@ flows — with a single subprocess test for stdio.
 ```text
 tests/interaction/
   _requirements.py      the requirements manifest (see below)
-  _helpers.py           shared type aliases + the wire-recording transport
+  _helpers.py           the wire-recording transport
   _connect.py           the transport-parametrized connection factories
   conftest.py           the connect fixture (the transport matrix)
   test_coverage.py      enforces the manifest ↔ test contract
@@ -70,7 +70,7 @@ real-clock timeout tests (the timeout machinery is transport-independent and mus
 transport latency), and everything under `transports/`, which pins behaviour only observable on
 that transport.
 
-A transport conformance test in `transports/` speaks raw `httpx` against the mounted ASGI app
+A transport conformance test in `transports/` speaks raw `httpx2` against the mounted ASGI app
 **only** when its assertion is about HTTP semantics that `Client` cannot observe — status codes,
 response headers, SSE event fields, which stream a message travels on. Any other behaviour is
 asserted through a `Client`, connected to the mounted app via `client_via_http(http)` so several

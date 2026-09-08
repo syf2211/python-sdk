@@ -12,7 +12,7 @@ from collections.abc import Callable
 from typing import Any
 
 import anyio
-import httpx
+import httpx2
 import pytest
 from mcp_types import (
     CLIENT_CAPABILITIES_META_KEY,
@@ -24,18 +24,22 @@ from mcp_types import (
     METHOD_NOT_FOUND,
     PARSE_ERROR,
     PROTOCOL_VERSION_META_KEY,
+    SERVER_INFO_META_KEY,
+    UNSUPPORTED_PROTOCOL_VERSION,
     CallToolRequestParams,
     CallToolResult,
+    ClientCapabilities,
     ErrorData,
     JSONRPCError,
     JSONRPCResponse,
     ListToolsResult,
     LoggingMessageNotification,
     LoggingMessageNotificationParams,
+    NotificationParams,
     PaginatedRequestParams,
     Tool,
 )
-from mcp_types.version import LATEST_MODERN_VERSION
+from mcp_types.version import LATEST_MODERN_VERSION, MODERN_PROTOCOL_VERSIONS
 from starlette.types import Message, Receive, Scope, Send
 from trio.testing import MockClock
 
@@ -53,6 +57,11 @@ from mcp.shared.transport_context import TransportContext
 from tests.interaction.transports import StreamingASGITransport
 
 pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture(autouse=True)
+def _module_runner_lease() -> None:
+    """Opt out of the shared per-module event loop: this module parametrizes `anyio_backend`."""
 
 
 async def test_single_exchange_dispatch_context_has_no_back_channel() -> None:
@@ -76,12 +85,12 @@ def _asgi_client(
     *,
     json_response: bool = True,
     accept: str = "application/json, text/event-stream",
-) -> httpx.AsyncClient:
+) -> httpx2.AsyncClient:
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
         async with server.lifespan(server) as lifespan_state:
             await handle_modern_request(server, security_settings, json_response, lifespan_state, scope, receive, send)
 
-    return httpx.AsyncClient(
+    return httpx2.AsyncClient(
         transport=StreamingASGITransport(app),
         base_url="http://testserver",
         headers={
@@ -103,18 +112,91 @@ async def test_handle_modern_request_rejects_non_post_with_http_405_and_allow_he
     assert response.content == b""
 
 
-async def test_handle_modern_request_rejects_a_notification_body_with_invalid_request() -> None:
-    """SDK-defined: well-formed JSON that isn't a single JSON-RPC request object (e.g. a
-    notification, which lacks ``id``) is ``INVALID_REQUEST`` — distinct from ``PARSE_ERROR``,
-    which is for malformed JSON."""
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(
+            {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}, id="cancelled"
+        ),
+        pytest.param({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}, id="removed-at-2026"),
+        pytest.param({"jsonrpc": "2.0", "method": "acme/heartbeat", "params": {"n": 1}}, id="custom"),
+        pytest.param(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": "listen:0", "_meta": {PROTOCOL_VERSION_META_KEY: LATEST_MODERN_VERSION}},
+            },
+            id="with-envelope",
+        ),
+    ],
+)
+async def test_handle_modern_request_acknowledges_a_notification_post_with_202_and_drops_it(
+    body: dict[str, Any],
+) -> None:
+    """Spec-permitted (streamable-http §Sending Messages item 5, the accept branch): a POST whose
+    body is one JSON-RPC notification is answered 202 with no body, whatever its method and
+    whether or not it carries a `_meta` envelope. SDK-defined: it is dropped, not dispatched --
+    a registered handler for the method never runs (strict-no-cover fails CI if it does)."""
+
+    async def on_notify(ctx: Any, params: NotificationParams) -> None:
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    server: Server[Any] = Server("test")
+    server.add_notification_handler(body["method"], NotificationParams, on_notify)
+    async with _asgi_client(server) as http:
+        response = await http.post("/mcp", json=body)
+    assert (response.status_code, response.content) == (202, b"")
+
+
+async def test_handle_modern_request_rejects_a_notification_post_at_an_unserved_version() -> None:
+    """SDK-defined: the manager routes any non-handshake `MCP-Protocol-Version` here, so a
+    notification claiming a version this entry does not serve gets the same
+    `UNSUPPORTED_PROTOCOL_VERSION` answer (HTTP 400, `supported` list) a request would."""
     async with _asgi_client(Server("test")) as http:
         response = await http.post(
             "/mcp",
-            content=b'{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}',
-            headers={"content-type": "application/json"},
+            json={"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}},
+            headers={MCP_PROTOCOL_VERSION_HEADER: "2099-01-01"},
         )
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == INVALID_REQUEST
+    assert response.json() == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {
+            "code": UNSUPPORTED_PROTOCOL_VERSION,
+            "message": "Unsupported protocol version",
+            "data": {"supported": list(MODERN_PROTOCOL_VERSIONS), "requested": "2099-01-01"},
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"jsonrpc": "2.0", "id": 1, "result": {}}, id="posted-response"),
+        pytest.param({"jsonrpc": "2.0", "id": 1, "error": {"code": -1, "message": "x"}}, id="posted-error"),
+        pytest.param([{"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}], id="batch"),
+        pytest.param({"jsonrpc": "2.0", "id": None, "method": "tools/list"}, id="null-id-request"),
+        pytest.param({"jsonrpc": "2.0", "id": [1], "method": "tools/list"}, id="non-scalar-id-request"),
+        pytest.param({"jsonrpc": "2.0", "method": 7}, id="non-string-method-notification"),
+        pytest.param({"jsonrpc": "1.0", "method": "notifications/cancelled"}, id="wrong-jsonrpc-version"),
+        pytest.param("just a string", id="scalar"),
+    ],
+)
+async def test_handle_modern_request_rejects_a_body_that_is_neither_request_nor_notification(body: Any) -> None:
+    """Spec-mandated (streamable-http §Sending Messages item 4): the body MUST be a single request
+    or notification and clients MUST NOT post responses. SDK-defined: anything else -- a posted
+    response, a batch, a request whose `id` is malformed, a scalar -- is `INVALID_REQUEST` at
+    HTTP 400 with `id: null`, distinct from `PARSE_ERROR` (malformed JSON). A malformed-`id`
+    request in particular must not be mistaken for a notification and silently 202'd."""
+    async with _asgi_client(Server("test")) as http:
+        response = await http.post("/mcp", json=body)
+    assert response.status_code == 400
+    assert response.json() == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": INVALID_REQUEST, "message": "Body must be a single JSON-RPC request or notification object"},
+    }
 
 
 async def test_handle_modern_request_rejects_malformed_body_with_parse_error() -> None:
@@ -153,6 +235,40 @@ def _list_tools_body() -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": meta}}
 
 
+async def test_handle_modern_request_serves_pair_only_envelope_without_client_info() -> None:
+    """Spec-mandated (spec PR #3002): `clientInfo` is optional - a request whose
+    `_meta` carries only the protocol-version + client-capabilities pair is
+    served, with the declared capabilities recorded and `client_params` None."""
+    seen: list[tuple[object, object]] = []
+
+    async def list_tools(ctx: ServerRequestContext, params: PaginatedRequestParams | None) -> ListToolsResult:
+        seen.append((ctx.session.client_params, ctx.session.client_capabilities))
+        return ListToolsResult(tools=[], ttl_ms=0, cache_scope="public")
+
+    server: Server[Any] = Server("test", on_list_tools=list_tools)
+    body = _list_tools_body()
+    del body["params"]["_meta"][CLIENT_INFO_META_KEY]
+    async with _asgi_client(server) as http:
+        response = await http.post("/mcp", json=body, headers={MCP_METHOD_HEADER: "tools/list"})
+    assert response.status_code == 200
+    assert response.json()["result"]["tools"] == []
+    assert seen == [(None, ClientCapabilities())]
+
+
+async def test_handle_modern_request_missing_capabilities_rejects_naming_the_key() -> None:
+    """Spec-mandated (basic/index.mdx): the protocol version without the
+    required client-capabilities key is malformed - INVALID_PARAMS (HTTP 400)
+    with a message naming the missing key."""
+    body = _list_tools_body()
+    del body["params"]["_meta"][CLIENT_CAPABILITIES_META_KEY]
+    async with _asgi_client(Server("test")) as http:
+        response = await http.post("/mcp", json=body, headers={MCP_METHOD_HEADER: "tools/list"})
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == INVALID_PARAMS
+    assert CLIENT_CAPABILITIES_META_KEY in error["message"]
+
+
 async def test_handle_modern_request_routes_with_mis_shaped_envelope_client_info() -> None:
     """SDK-defined: a mis-shaped ``clientInfo`` envelope value is treated as not supplied —
     the request still routes (200 + result) and the handler observes ``client_params is None``
@@ -173,7 +289,12 @@ async def test_handle_modern_request_routes_with_mis_shaped_envelope_client_info
     async with _asgi_client(server) as http:
         response = await http.post("/mcp", json=body, headers={MCP_METHOD_HEADER: "custom/greet"})
     assert response.status_code == 200
-    assert response.json()["result"] == {"ok": True}
+    result = response.json()["result"]
+    assert result == {
+        "_meta": {SERVER_INFO_META_KEY: {"name": "test", "version": ""}},
+        "ok": True,
+        "resultType": "complete",
+    }
     assert seen == [None]
 
 
@@ -704,6 +825,20 @@ async def test_modern_tools_call_accepts_matching_mcp_param_header() -> None:
     assert response.json()["result"]["content"] == []
 
 
+async def test_modern_tools_call_validates_mcp_param_headers_for_a_pair_only_envelope() -> None:
+    """The schema-resolving `tools/list` walk builds its synthetic envelope from the caller's:
+    a pair-only caller (spec PR #3002, no clientInfo) omits the optional key rather than sending
+    null, so header validation still runs and a mismatched header is still rejected."""
+    body = _tool_call_body({"region": "east"})
+    del body["params"]["_meta"][CLIENT_INFO_META_KEY]
+    async with _asgi_client(_x_mcp_server()) as http:
+        matched = await http.post("/mcp", json=body, headers=_TOOL_CALL_HEADERS | {"mcp-param-region": "east"})
+        mismatched = await http.post("/mcp", json=body, headers=_TOOL_CALL_HEADERS | {"mcp-param-region": "west"})
+    assert matched.status_code == 200
+    assert mismatched.status_code == 400
+    assert mismatched.json()["error"]["code"] == HEADER_MISMATCH
+
+
 @pytest.mark.parametrize("json_response", [True, False])
 async def test_modern_tools_call_rejects_mcp_param_mismatch_with_400_and_header_mismatch(
     json_response: bool,
@@ -889,8 +1024,8 @@ async def test_modern_tools_call_leaves_mis_shaped_name_and_arguments_to_dispatc
 
 async def test_modern_tools_call_rejects_a_duplicated_mcp_param_header() -> None:
     """A duplicated recognized header is rejected even if one copy matches: readers may disagree on which wins."""
-    # An httpx header list with a repeated name reaches the ASGI scope as two raw header lines.
-    duplicated = httpx.Headers(
+    # An httpx2 header list with a repeated name reaches the ASGI scope as two raw header lines.
+    duplicated = httpx2.Headers(
         [*_TOOL_CALL_HEADERS.items(), ("mcp-param-region", "spoofed"), ("mcp-param-region", "eu")]
     )
     async with _asgi_client(_x_mcp_server()) as http:
@@ -923,7 +1058,7 @@ async def test_modern_synthetic_listing_does_not_replay_caller_meta_extras() -> 
 
 async def test_modern_post_rejects_a_duplicated_routing_header() -> None:
     """A duplicated routing header (`Mcp-Name`) is unverifiable and rejected before the validation ladder runs."""
-    duplicated = httpx.Headers(
+    duplicated = httpx2.Headers(
         [(MCP_METHOD_HEADER, "tools/call"), (MCP_NAME_HEADER, "search"), (MCP_NAME_HEADER, "admin-tool")]
     )
     async with _asgi_client(_x_mcp_server()) as http:
@@ -1058,10 +1193,10 @@ async def test_json_response_mode_still_streams_subscriptions_listen() -> None:
     the SSE path, acks first, and ends with the stamped result on close()."""
     bus = _OpenSignalBus()
     handler = ListenHandler(bus)
-    server = Server("test", on_subscriptions_listen=handler)
+    server = Server("test", version="1.2.3", on_subscriptions_listen=handler)
     body = _listen_body()
 
-    responses: list[httpx.Response] = []
+    responses: list[httpx2.Response] = []
     async with _asgi_client(server, json_response=True) as http:
         async with anyio.create_task_group() as tg:
 
@@ -1081,4 +1216,9 @@ async def test_json_response_mode_still_streams_subscriptions_listen() -> None:
     events = _sse_payloads(response.text)
     assert events[0]["method"] == "notifications/subscriptions/acknowledged"
     assert events[1]["id"] == 9
-    assert events[1]["result"]["_meta"] == {"io.modelcontextprotocol/subscriptionId": 9}
+    # The terminal listen result is a modern-era result like any other, so it
+    # carries the serverInfo stamp alongside the subscription id.
+    assert events[1]["result"]["_meta"] == {
+        "io.modelcontextprotocol/subscriptionId": 9,
+        SERVER_INFO_META_KEY: {"name": "test", "version": "1.2.3"},
+    }
