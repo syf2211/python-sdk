@@ -46,7 +46,7 @@ import anyio
 import mcp_types as types
 from pydantic import ValidationError
 from sse_starlette import EventSourceResponse
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
@@ -265,7 +265,12 @@ class SseServerTransport:
             response = Response("Could not find session", status_code=404)
             return await response(scope, receive, send)
 
-        body = await request.body()
+        try:
+            body = await request.body()
+        except ClientDisconnect:
+            logger.debug("Client disconnected before POST body was received")
+            return
+
         logger.debug(f"Received JSON: {body}")
 
         try:
